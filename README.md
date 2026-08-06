@@ -1,4 +1,4 @@
-# Release & Security Watcher
+# Open Source Governance
 
 POC. This proof of concept keeps an eye on an open-source GitHub project for new releases, security advisories, CVEs, and LTS (Long-Term Support) updates. Instead of sending every client the same generic update, it checks which version each client is running and only reports the changes that are actually relevant to them.
 
