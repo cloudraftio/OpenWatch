@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from .profiles import DEFAULT_REPO, get_profile, normalise_repo
 
-LEGACY_STATE_FILE = "watcher_state.json"  # Kept for the original Prometheus-only default.
+DEFAULT_DUCKDB = "openwatch.duckdb"  # One database for every watched repo; rows carry the repo.
 
 
 @dataclass
@@ -18,14 +18,23 @@ class Config:
     docs_repo: str | None = field(default_factory=lambda: os.environ.get("LTS_DOCS_REPO") or None)
     lts_doc_path: str | None = field(default_factory=lambda: os.environ.get("LTS_DOC_PATH") or None)
     github_token: str | None = field(default_factory=lambda: os.environ.get("GITHUB_TOKEN"))
-    # Blank means "derive from the repo" - see state_file_path().
+    # Opt into the JSON backend by naming a file; blank leaves storage to DuckDB.
+    # One file holds one repo, so watching several needs one path each.
     state_file: str = field(default_factory=lambda: os.environ.get("WATCHER_STATE_FILE", ""))
     eol_reminder_days: int = 90
     # Newest-first cap on how many releases to fetch; 0 fetches every one. Large repos
     # (kubernetes, grafana) have thousands, which is a lot of unauthenticated API calls.
     max_releases: int = field(default_factory=lambda: int(os.environ.get("MAX_RELEASES", "0")))
+    # Fetch CISA KEV + EPSS to rank findings by real-world exploitation. Off makes runs
+    # fully offline-ish (GitHub only) at the cost of priority accuracy.
+    enrich_exploit_signals: bool = field(
+        default_factory=lambda: os.environ.get("ENRICH_EXPLOIT_SIGNALS", "1") not in ("0", "false", "no")
+    )
     # Optional JSON client registry; takes precedence over the storage backend's Clients table.
     clients_file: str = field(default_factory=lambda: os.environ.get("CLIENTS_FILE", ""))
+    # DuckDB database to store state in - a file path, or a MotherDuck connection string
+    # ("md:openwatch"). Blank means the default database; see duckdb_path().
+    duckdb_database: str = field(default_factory=lambda: os.environ.get("OPENWATCH_DUCKDB", ""))
 
     # Backs the still-stubbed integrations (see the corresponding modules).
     exa_api_key: str | None = field(default_factory=lambda: os.environ.get("EXA_API_KEY"))
@@ -63,13 +72,13 @@ class Config:
         """Short, human-facing name for the watched project, e.g. "prometheus"."""
         return self.repo.split("/")[-1]
 
-    def state_file_path(self) -> str:
-        """Where local state lives - one file per repo, so watching several can't cross-contaminate."""
-        if self.state_file:
-            return self.state_file
-        if self.repo.lower() == DEFAULT_REPO:
-            return LEGACY_STATE_FILE
-        return f"watcher_state-{get_profile(self.repo).slug}.json"
+    def duckdb_path(self) -> str:
+        """Which DuckDB database to use - one shared file unless an env var points elsewhere.
+
+        Unlike the JSON file there is no per-repo path, because every row records the
+        repo it belongs to and each run reads back only its own.
+        """
+        return self.duckdb_database or DEFAULT_DUCKDB
 
     @classmethod
     def from_env(cls) -> "Config":

@@ -1,4 +1,4 @@
-"""CLI entrypoint (`promwatch`)."""
+"""CLI entrypoint (`openwatch`)."""
 from __future__ import annotations
 
 import argparse
@@ -9,15 +9,63 @@ import sys
 from . import clients as clients_mod
 from . import semver
 from .config import Config
+from .cve.github_advisories import GitHubAdvisoriesSource
 from .github_releases import GitHubReleasesClient, RepoNotFound
 from .notify.base import Notifier
 from .notify.console import ConsoleNotifier
 from .pipeline import run_once
 from .profiles import DEFAULT_REPO, normalise_repo
+from .scoring import Priority
 from .storage.base import Storage
 from .storage.local_json import LocalJSONStorage
 
 logger = logging.getLogger(__name__)
+
+# Exposed as --priority; the report lists everything at or above the chosen floor.
+PRIORITY_CHOICES = {
+    "act-now": Priority.ACT_NOW,
+    "patch-soon": Priority.PATCH_SOON,
+    "schedule": Priority.SCHEDULE,
+    "review": Priority.REVIEW,
+}
+
+
+def cmd_report(config: Config, storage: Storage, args) -> int:
+    """Render the current exposure of every client, independent of what has been notified."""
+    from . import report as report_mod
+    from .pipeline import _load_clients, analyse
+
+    registry = _load_clients(config, storage)
+    if not registry:
+        raise SystemExit(
+            f"No clients recorded for {config.repo}, so there is nothing to report on.\n"
+            f"Add one with: openwatch --repo {config.repo} add-client --name '<name>' --version <version>"
+        )
+    analysis = analyse(config, cve_sources=build_cve_sources(config))
+    fleet = report_mod.build(
+        repo=config.repo,
+        registry=registry,
+        findings=analysis.findings,
+        latest_stable=analysis.latest_stable,
+        latest_lts_patch=analysis.latest_lts_patch,
+        min_priority=PRIORITY_CHOICES[args.priority],
+    )
+
+    path = args.output
+    fmt = args.format or ("html" if path and path.endswith((".html", ".htm")) else "md")
+    text = report_mod.render_html(fleet) if fmt == "html" else report_mod.render_markdown(fleet)
+    if path:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        print(f"Wrote {fmt} report for {len(fleet.clients)} client(s) to {path}")
+    else:
+        print(text)
+    return 0
+
+
+def build_cve_sources(config: Config) -> list:
+    """Feeds that add severity and fix ranges on top of what release notes say."""
+    return [GitHubAdvisoriesSource(repo=config.repo, token=config.github_token)]
 
 
 def build_notifiers(config: Config) -> list[Notifier]:
@@ -27,9 +75,15 @@ def build_notifiers(config: Config) -> list[Notifier]:
 
 
 def build_storage(config: Config) -> Storage:
-    """Use Google Sheets when both its env vars are set, otherwise the local JSON file."""
+    """Pick a backend. DuckDB is the default; the others are opt-in by configuring them.
+
+    Explicit beats implicit: a database or state file named outright wins, then Sheets,
+    then the default DuckDB database.
+    """
+    if config.duckdb_database:
+        return _duckdb_storage(config)
     # Half-configured Sheets is nearly always a shell that never sourced .env, so say
-    # so rather than quietly writing to a local file the user won't think to look in.
+    # so rather than quietly writing somewhere the user won't think to look.
     if bool(config.google_service_account_json) != bool(config.google_spreadsheet_id):
         missing = "GOOGLE_SERVICE_ACCOUNT_JSON" if config.google_spreadsheet_id else "GOOGLE_SPREADSHEET_ID"
         logger.warning("%s is not set, so Google Sheets is skipped and state stays local.", missing)
@@ -40,9 +94,18 @@ def build_storage(config: Config) -> Storage:
         return GoogleSheetsStorage(
             config.google_service_account_json, config.google_spreadsheet_id, repo=config.repo
         )
-    path = config.state_file_path()
-    logger.info("Using local JSON storage (%s)", path)
-    return LocalJSONStorage(path)
+    if config.state_file:
+        logger.info("Using local JSON storage (%s)", config.state_file)
+        return LocalJSONStorage(config.state_file)
+    return _duckdb_storage(config)
+
+
+def _duckdb_storage(config: Config) -> Storage:
+    from .storage.duckdb_store import DuckDBStorage  # Imported lazily; duckdb is an extra.
+
+    path = config.duckdb_path()
+    logger.info("Using DuckDB storage (%s)", path)
+    return DuckDBStorage(path, repo=config.repo)
 
 
 def _prompt(label: str, required: bool) -> str:
@@ -189,7 +252,7 @@ def cmd_list_clients(config: Config, storage: Storage) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="promwatch", description="Release & Security Watcher for any open-source GitHub repo"
+        prog="openwatch", description="Release & Security Watcher for any open-source GitHub repo"
     )
     parser.add_argument(
         "--repo",
@@ -199,11 +262,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--state-file", default=None, help="Path to the local JSON state store")
     parser.add_argument(
+        "--duckdb",
+        default=None,
+        metavar="DATABASE",
+        help='Store state in DuckDB instead: a file path, or a MotherDuck string ("md:openwatch")',
+    )
+    parser.add_argument(
         "--max-releases", type=int, default=None, help="Only fetch the N newest releases (0 = all)"
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="Run the watcher pipeline (default)")
+    rep = sub.add_parser("report", help="Report every client's current CVE exposure")
+    rep.add_argument("-o", "--output", default=None, help="Write to this file instead of stdout")
+    rep.add_argument("--format", choices=("md", "html"), default=None, help="Defaults to the output extension")
+    rep.add_argument(
+        "--priority",
+        choices=tuple(PRIORITY_CHOICES),
+        default="review",
+        help="Lowest priority to list; counts still cover everything evaluated",
+    )
     add = sub.add_parser("add-client", help="Record a client name and the version they run")
     add.add_argument("--name", default=None, help="Client name; prompted for if omitted")
     add.add_argument("--version", default=None, help="The version they run; prompted for if omitted")
@@ -218,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
     config = Config.from_env()
     if args.state_file:
         config.state_file = args.state_file
+    if args.duckdb:
+        config.duckdb_database = args.duckdb
     if args.max_releases is not None:
         config.max_releases = args.max_releases
     try:
@@ -240,10 +320,17 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_remove_client(storage, args)
     if args.command == "list-clients":
         return cmd_list_clients(config, storage)
+    if args.command == "report":
+        return cmd_report(config, storage, args)
 
     prompt_for_clients_if_empty(config, storage)
     try:
-        run_once(config=config, storage=storage, notifiers=build_notifiers(config))
+        run_once(
+            config=config,
+            storage=storage,
+            notifiers=build_notifiers(config),
+            cve_sources=build_cve_sources(config),
+        )
     except RepoNotFound as exc:
         raise SystemExit(str(exc)) from exc
     return 0

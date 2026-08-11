@@ -1,7 +1,19 @@
 __pycache__/
 *.pyc
-*.egg-info/
 .venv/
 venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+watcher_state.json
+watcher_state-*.json
+*.duckdb
+*.duckdb.wal
+# The default database is the watcher's state, and CI commits it back after each run.
+!openwatch.duckdb
 .env
-watcher_state*.json
+# Ad-hoc local reports (openwatch report -o <name>-report.md). Anchored to the repo
+# root so it can't reach into reports/, which the watch workflow commits on purpose.
+/*-report.html
+/*-report.md

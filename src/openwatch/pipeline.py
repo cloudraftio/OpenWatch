@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import date
 
-from . import clients, lts, release_notes_cves, risk, semver
+from . import clients, exploit, lts, release_notes_cves, risk, semver
 from .changelog.base import ChangelogParser
 from .changelog.release_notes import ReleaseNotesParser
 from .config import Config
@@ -76,20 +77,39 @@ def _load_clients(config: Config, storage: Storage):
         return []
 
 
-def run_once(
+@dataclass
+class Analysis:
+    """Everything one pass learns about a repo, before any of it is persisted or delivered.
+
+    Kept separate from Digest because a digest is "what changed since last time" while
+    this is "what is true right now" - reporting needs the latter.
+    """
+
+    repo: str
+    releases: list[Release] = field(default_factory=list)
+    latest_stable: object | None = None
+    latest_lts_patch: object | None = None
+    lts_entries: list = field(default_factory=list)
+    reminders: list = field(default_factory=list)
+    summaries: dict = field(default_factory=dict)
+    findings: list[CVEFinding] = field(default_factory=list)
+
+
+def analyse(
     config: Config,
-    storage: Storage,
-    notifiers: list[Notifier],
     cve_sources: list[CVESource] | None = None,
     releases_client: GitHubReleasesClient | None = None,
     changelog_parser: ChangelogParser | None = None,
     today: date | None = None,
-) -> Digest:
-    """Execute one pipeline pass: fetch, resolve versions, refresh LTS, scan CVEs, persist, notify."""
+) -> Analysis:
+    """Fetch and evaluate the upstream project. Reads only - never touches storage.
+
+    Both the watcher run and the client report go through here, so the two can never
+    disagree about which CVEs exist or which releases fixed them.
+    """
     today = today or date.today()
     client = releases_client or GitHubReleasesClient(repo=config.repo, token=config.github_token)
     parser = changelog_parser or ReleaseNotesParser()
-    _guard_state_repo(config, storage)
 
     # --- Fetch GitHub Releases ---
     releases = _fetch_releases(client, config.max_releases)
@@ -144,11 +164,52 @@ def run_once(
         )
 
     # --- Collect Security Data: pluggable sources (GH advisories/govulncheck/Trivy) ---
+    # Sources overlap heavily - release notes and the project's own advisories describe
+    # the same CVEs - so merge per ID rather than reporting each flaw several times.
+    by_id = {finding.cve_id: finding for finding in findings}
     for source in cve_sources or []:
         try:
-            findings.extend(source.collect())
+            for finding in source.collect():
+                existing = by_id.get(finding.cve_id)
+                by_id[finding.cve_id] = finding.merge(existing) if existing else finding
         except NotImplementedError as exc:
             logger.warning("Skipping CVE source %r: %s", source.name, exc)
+    findings = list(by_id.values())
+
+    # --- Real-world exploitation signals (KEV / EPSS) ---
+    if config.enrich_exploit_signals:
+        findings = exploit.enrich(findings)
+
+    return Analysis(
+        repo=config.repo,
+        releases=releases,
+        latest_stable=latest_stable,
+        latest_lts_patch=latest_lts_patch,
+        lts_entries=lts_entries,
+        reminders=reminders,
+        summaries=summaries,
+        findings=findings,
+    )
+
+
+def run_once(
+    config: Config,
+    storage: Storage,
+    notifiers: list[Notifier],
+    cve_sources: list[CVESource] | None = None,
+    releases_client: GitHubReleasesClient | None = None,
+    changelog_parser: ChangelogParser | None = None,
+    today: date | None = None,
+) -> Digest:
+    """Execute one pipeline pass: fetch, resolve versions, refresh LTS, scan CVEs, persist, notify."""
+    _guard_state_repo(config, storage)
+    analysis = analyse(config, cve_sources, releases_client, changelog_parser, today)
+    releases = analysis.releases
+    summaries = analysis.summaries
+    findings = analysis.findings
+    latest_stable = analysis.latest_stable
+    latest_lts_patch = analysis.latest_lts_patch
+    reminders = analysis.reminders
 
     # --- Persist + idempotency check (section 7) ---
     new_release_tags = []
