@@ -11,7 +11,7 @@ python -m venv .venv && source .venv/bin/activate
 
 pip install -e .
 
-promwatch run
+openwatch run
 ```
 
 An interactive run starts by asking which repo to watch:
@@ -29,8 +29,8 @@ the repo up front — this is also how scheduled runs pick their target, since
 nothing is ever prompted when stdin isn't a terminal:
 
 ```bash
-promwatch --repo grafana/grafana run       # owner/name or a full GitHub URL
-WATCH_REPO=hashicorp/vault promwatch run   # same thing, via the environment
+openwatch --repo grafana/grafana run       # owner/name or a full GitHub URL
+WATCH_REPO=hashicorp/vault openwatch run   # same thing, via the environment
 ```
 
 ### What differs per repo
@@ -40,7 +40,35 @@ WATCH_REPO=hashicorp/vault promwatch run   # same thing, via the environment
 | Releases and tags | Read from the GitHub API. Repos that publish no Releases fall back to their git tags (no changelog text). |
 | Changelogs | Prometheus-style `* [SECURITY] ...` bullets are parsed exactly. Projects that don't tag their bullets fall back to keyword categorisation, so security items are still picked out. |
 | CVEs | Any `CVE-…` mentioned anywhere in a release body is collected, for every project. |
-| LTS lifecycle | Only for projects known to publish a "List of LTS releases" markdown table. Prometheus ships with one out of the box; see [profiles.py](src/prom_release_watcher/profiles.py) to add another, or set `LTS_DOCS_REPO` / `LTS_DOC_PATH`. Other repos simply run without that section. |
+| LTS lifecycle | Only for projects known to publish a "List of LTS releases" markdown table. Prometheus ships with one out of the box; see [profiles.py](src/openwatch/profiles.py) to add another, or set `LTS_DOCS_REPO` / `LTS_DOC_PATH`. Other repos simply run without that section. |
+
+### Reports
+
+`openwatch report` shows where every client stands right now — unlike the digest, it
+ignores what has already been notified, so it is complete every time.
+
+```bash
+openwatch report                              # markdown to stdout
+openwatch report -o report.html               # self-contained HTML, printable
+openwatch report --priority act-now           # only what needs acting on today
+```
+
+Each CVE is ranked from three independent signals, so you can see which one fired:
+
+| Signal | Source | Answers |
+|---|---|---|
+| Severity / CVSS | the project's own GitHub Security Advisories | how bad is it |
+| CISA KEV | `known_exploited_vulnerabilities.json` | is it being exploited right now |
+| EPSS | FIRST.org | how likely is exploitation in the next 30 days |
+| Applicability | the client's recorded version vs. the fixing releases | can it reach *this* client |
+
+Priorities are `act now` (applicable **and** exploited in the wild, or high severity and
+reachable pre-auth), `patch soon`, `schedule`, and `review` (exposure unresolved).
+`--priority` sets the floor for what gets listed; the counts always cover everything
+evaluated, and a client whose findings were all filtered out reads "below filter"
+rather than "clear".
+
+Set `ENRICH_EXPLOIT_SIGNALS=0` to skip the KEV and EPSS fetches.
 
 ### Clients
 
@@ -49,9 +77,9 @@ runs, so advisories can be mapped per client. Press Enter at the name prompt
 to skip and get one common digest instead. Manage them later with:
 
 ```bash
-promwatch add-client --name "<name>" --version <version> --contact <email>
-promwatch list-clients
-promwatch remove-client --name "<name>"
+openwatch add-client --name "<name>" --version <version> --contact <email>
+openwatch list-clients
+openwatch remove-client --name "<name>"
 ```
 
 Clients are recorded per repo, since a version number only means something
@@ -76,13 +104,100 @@ read one project at a time in the browser, sort or filter by the `repo` column.
 Spreadsheets written before this column existed are upgraded automatically on
 the next run, with every existing row credited to the repo that wrote it.
 
-**Local JSON:** each repo gets its own file — `watcher_state-<owner>-<name>.json`,
-or `watcher_state.json` for Prometheus. A file holds one project, and a run
-that finds another repo's data in it stops rather than mixing the two.
+**DuckDB:** one database holds as many projects as you like, scoped the same way
+— every table leads with a `repo` column and each run reads and writes only its
+own rows.
+
+**Local JSON:** a file holds one project, so watching several means one
+`WATCHER_STATE_FILE` path each. A run that finds another repo's data in its file
+stops rather than mixing the two.
+
+## Running it on a schedule
+
+[`.github/workflows/watch.yml`](.github/workflows/watch.yml) runs daily at 06:00
+UTC. Set a `WATCH_REPOS` repository variable to the projects you want tracked,
+space separated:
+
+```text
+WATCH_REPOS = prometheus/prometheus cloudnative-pg/cloudnative-pg
+```
+
+Each run watches every listed repo in turn, then renders a client exposure
+report per repo into `reports/<owner>-<name>.md`. The reports also go to the
+workflow run summary, so you can read them in the Actions tab without cloning.
+The database and the reports are committed back afterwards.
+
+Repos are processed sequentially rather than as a job matrix, because DuckDB
+takes one writer at a time and parallel jobs would each commit a different
+version of the database.
+
+Clients are read from whatever is already recorded, so `add-client` is a one-off
+setup step per repo — the schedule picks them up from then on. A repo with no
+clients still gets watched, it just has no fleet to report on, and the run says
+so instead of failing.
+
+## Storing data in DuckDB
+
+DuckDB is the default backend and needs no configuration — `openwatch run`
+creates `openwatch.duckdb` in the working directory and stores everything there.
+`OPENWATCH_DUCKDB` (or `--duckdb <database>` for a single run) points it
+somewhere else. The first line of the output confirms which backend is in use:
+
+```text
+Using DuckDB storage (openwatch.duckdb)
+```
+
+The database is created on first use with three tables:
+
+| Table | Columns |
+|-------|---------|
+| `seen` | `repo`, `category`, `identifier`, `first_seen` |
+| `pointers` | `repo`, `key`, `value` |
+| `clients` | `repo`, `name`, `version`, `contact` |
+
+`category` is `release`, `advisory`, or `client_risk` — the three worksheets
+the Sheets backend keeps separate, folded into one table. Query it with any
+DuckDB client:
+
+```sql
+SELECT repo, identifier AS cve, first_seen
+FROM seen WHERE category = 'advisory' ORDER BY first_seen DESC LIMIT 10;
+```
+
+DuckDB is a single-writer embedded database, so run one watcher at a time
+against a given file. To share one database between machines, or to avoid
+committing it back from CI, point `OPENWATCH_DUCKDB` at a
+[MotherDuck](https://motherduck.com) database instead — the connection string is
+the only difference:
+
+```bash
+export MOTHERDUCK_TOKEN=<token>
+export OPENWATCH_DUCKDB=md:openwatch
+```
+
+New database files are created with 16KB blocks rather than DuckDB's 256KB
+default, which keeps a watcher's worth of state at roughly 45KB instead of
+500KB. That only matters because [the workflow](.github/workflows/watch.yml)
+commits the database back to the repo after each run.
+
+### Which backend a run uses
+
+The first match wins:
+
+1. `OPENWATCH_DUCKDB` or `--duckdb` — DuckDB at that database.
+2. `GOOGLE_SERVICE_ACCOUNT_JSON` **and** `GOOGLE_SPREADSHEET_ID` — Google Sheets.
+3. `WATCHER_STATE_FILE` or `--state-file` — the JSON file at that path.
+4. Nothing set — DuckDB at `openwatch.duckdb`.
+
+Switching backends does not carry state across. A backend that has never seen a
+repo treats every existing release and CVE as new on its first run.
 
 ## Storing data in Google Sheets
 
-By default, the watcher stores everything locally in a per-repo JSON file. If you'd rather keep the data in Google Sheets, install the optional Sheets support and set the following environment variables before running the watcher:
+Sheets is the backend to pick when people other than the watcher need to read or
+edit the data by hand — the `Clients` worksheet especially. Install the optional
+Sheets support and set the following environment variables before running the
+watcher:
 
 ```bash
 pip install -e ".[sheets]"
@@ -90,10 +205,10 @@ pip install -e ".[sheets]"
 export GOOGLE_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
 export GOOGLE_SPREADSHEET_ID=<spreadsheet ID from the URL>
 
-promwatch run
+openwatch run
 ```
 
-Both environment variables are required. If either one is missing, the watcher automatically falls back to using the local JSON state file. You can confirm which storage backend is being used by checking the first line of the output:
+Both environment variables are required. If either one is missing, the watcher falls back to DuckDB, and says so rather than doing it silently. You can confirm which storage backend is being used by checking the first line of the output:
 
 ```text
 Using Google Sheets storage
@@ -131,6 +246,18 @@ a leading `repo` column identifying the project the row belongs to:
 | `Clients` | `repo`, `name`, `version`, `contact` |
 | `NotifiedRisks` | `repo`, `client_and_cve`, `first_seen` |
 
+### Other environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `WATCH_REPO` | Repo to watch, as `owner/name`. Skips the interactive question. Defaults to `prometheus/prometheus`. |
+| `GITHUB_TOKEN` | Optional. Increases the GitHub API rate limit from **60 requests/hour** to **5,000 requests/hour**. Worth setting for large repos. |
+| `WATCHER_STATE_FILE` | Opts into the JSON backend, storing state at this path. One repo per file. |
+| `OPENWATCH_DUCKDB` | DuckDB database to store state in — a file path, or `md:<name>` for MotherDuck. Defaults to `openwatch.duckdb`. |
+| `MAX_RELEASES` | Only fetch the N newest releases (`0`, the default, fetches all). Useful for repos with thousands of them. |
+| `LTS_DOCS_REPO` / `LTS_DOC_PATH` | Point LTS tracking at a project's release-cycle markdown file, e.g. `prometheus/docs` + `docs/introduction/release-cycle.md`. |
+| `CLIENTS_FILE` | Path to a JSON client registry. If provided, it takes precedence over the `Clients` worksheet. |
+
 ## Running the watcher multiple times
 
 The watcher is designed to be idempotent, so running it repeatedly won't create duplicate records.
@@ -139,4 +266,4 @@ The watcher is designed to be idempotent, so running it repeatedly won't create 
 - Security advisories are tracked by CVE ID.
 - Client notifications are tracked using the client and CVE combination.
 
-If a run doesn't find anything new, it simply doesn't write any new rows. An unchanged spreadsheet usually means the watcher is already up to date—not that something went wrong.
+If a run doesn't find anything new, it simply doesn't write any new rows. An unchanged database usually means the watcher is already up to date—not that something went wrong.
