@@ -10,10 +10,13 @@ watcher_state.json
 watcher_state-*.json
 *.duckdb
 *.duckdb.wal
-# The default database is the watcher's state, and CI commits it back after each run.
+# The default database is the watcher's state, kept in the repo.
 !openwatch.duckdb
 .env
 # Ad-hoc local reports (openwatch report -o <name>-report.md). Anchored to the repo
-# root so it can't reach into reports/, which the watch workflow commits on purpose.
+# root so it can't reach into reports/, where scripts/watch.sh writes its reports.
 /*-report.html
 /*-report.md
+# scripts/watch.sh run lock and the log the README's crontab line writes.
+.watch.lock
+watch.log

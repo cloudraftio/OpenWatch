@@ -60,6 +60,18 @@ def cmd_report(config: Config, storage: Storage, args) -> int:
         print(f"Wrote {fmt} report for {len(fleet.clients)} client(s) to {path}")
     else:
         print(text)
+
+    if config.slack_webhook_url:
+        import requests
+
+        from .notify.slack import SlackNotifier
+
+        try:
+            SlackNotifier(config.slack_webhook_url).send_report(fleet)
+        except requests.RequestException as exc:
+            # The report itself was produced, but a silent delivery failure would go unnoticed.
+            logger.error("Could not post the report to Slack: %s", exc)
+            return 1
     return 0
 
 
@@ -70,7 +82,7 @@ def build_cve_sources(config: Config) -> list:
 
 def build_notifiers(config: Config) -> list[Notifier]:
     notifiers: list[Notifier] = [ConsoleNotifier()]
-    # Slack/Email notifiers are stubs - append here once implemented.
+    # Slack only delivers `report` so far (see cmd_report); Email is a stub - append here once implemented.
     return notifiers
 
 

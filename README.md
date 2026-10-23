@@ -70,6 +70,12 @@ rather than "clear".
 
 Set `ENRICH_EXPLOIT_SIGNALS=0` to skip the KEV and EPSS fetches.
 
+Set `SLACK_WEBHOOK_URL` to an [incoming webhook](https://api.slack.com/messaging/webhooks)
+and every `openwatch report` also posts a summary to that channel: each client's status,
+its most urgent CVEs, the upgrade that clears them, and the CVEs by blast radius. Webhooks
+can't carry files, so the full HTML/markdown report stays wherever `-o` wrote it. A failed
+post makes the command exit non-zero, so a broken webhook doesn't go unnoticed.
+
 ### Clients
 
 The first interactive run asks for client names and the version each one
@@ -114,22 +120,36 @@ stops rather than mixing the two.
 
 ## Running it on a schedule
 
-[`.github/workflows/watch.yml`](.github/workflows/watch.yml) runs daily at 06:00
-UTC. Set a `WATCH_REPOS` repository variable to the projects you want tracked,
-space separated:
+[`scripts/watch.sh`](scripts/watch.sh) does one full scheduled run, and the
+host's own cron runs it. Put the settings in a `.env` file at the repo root
+(cron starts with an almost empty environment, so the script loads it itself),
+with `WATCH_REPOS` listing the projects to track, space separated:
 
-```text
-WATCH_REPOS = prometheus/prometheus cloudnative-pg/cloudnative-pg
+```bash
+WATCH_REPOS="prometheus/prometheus cloudnative-pg/cloudnative-pg"
+GITHUB_TOKEN=<token>
+SLACK_WEBHOOK_URL=<webhook>   # optional
 ```
 
-Each run watches every listed repo in turn, then renders a client exposure
-report per repo into `reports/<owner>-<name>.md`. The reports also go to the
-workflow run summary, so you can read them in the Actions tab without cloning.
-The database and the reports are committed back afterwards.
+Then add it to your crontab (`crontab -e`) — this runs daily at 06:00 and keeps
+a log:
 
-Repos are processed sequentially rather than as a job matrix, because DuckDB
-takes one writer at a time and parallel jobs would each commit a different
-version of the database.
+```cron
+0 6 * * * /path/to/OpenWatch/scripts/watch.sh >> /path/to/OpenWatch/watch.log 2>&1
+```
+
+Run `scripts/watch.sh` by hand once first to check it works. It uses the
+`.venv` (or `venv`) entry point when there is one, since cron's `PATH` won't
+include it; set `OPENWATCH_BIN` to use a different one.
+
+Each run watches every listed repo in turn, then renders a client exposure
+report per repo into `reports/<owner>-<name>.md`. State stays in the local
+database, so the machine running cron is the one that keeps it — or point
+`OPENWATCH_DUCKDB` at MotherDuck to keep it off the machine.
+
+Repos are processed sequentially, because DuckDB takes one writer at a time.
+For the same reason a run that starts while another is still going skips
+itself rather than failing midway.
 
 Clients are read from whatever is already recorded, so `add-client` is a one-off
 setup step per repo — the schedule picks them up from then on. A repo with no
@@ -165,8 +185,7 @@ FROM seen WHERE category = 'advisory' ORDER BY first_seen DESC LIMIT 10;
 ```
 
 DuckDB is a single-writer embedded database, so run one watcher at a time
-against a given file. To share one database between machines, or to avoid
-committing it back from CI, point `OPENWATCH_DUCKDB` at a
+against a given file. To share one database between machines, point `OPENWATCH_DUCKDB` at a
 [MotherDuck](https://motherduck.com) database instead — the connection string is
 the only difference:
 
@@ -177,8 +196,7 @@ export OPENWATCH_DUCKDB=md:openwatch
 
 New database files are created with 16KB blocks rather than DuckDB's 256KB
 default, which keeps a watcher's worth of state at roughly 45KB instead of
-500KB. That only matters because [the workflow](.github/workflows/watch.yml)
-commits the database back to the repo after each run.
+500KB, which matters when the database is committed to the repo.
 
 ### Which backend a run uses
 
@@ -257,6 +275,7 @@ a leading `repo` column identifying the project the row belongs to:
 | `MAX_RELEASES` | Only fetch the N newest releases (`0`, the default, fetches all). Useful for repos with thousands of them. |
 | `LTS_DOCS_REPO` / `LTS_DOC_PATH` | Point LTS tracking at a project's release-cycle markdown file, e.g. `prometheus/docs` + `docs/introduction/release-cycle.md`. |
 | `CLIENTS_FILE` | Path to a JSON client registry. If provided, it takes precedence over the `Clients` worksheet. |
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook. When set, `openwatch report` also posts the report to that channel. |
 
 ## Running the watcher multiple times
 
