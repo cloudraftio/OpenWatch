@@ -3,6 +3,7 @@ name = "openwatch"
 version = "0.1.0"
 description = "Tracks any open-source GitHub repo's releases, security advisories, CVEs, and LTS lifecycle, and broadcasts a digest to configured notification channels."
 requires-python = ">=3.10"
+license = { text = "MIT" }
 dependencies = [
     "requests>=2.31",
     "duckdb>=1.0",  # The default storage backend.
