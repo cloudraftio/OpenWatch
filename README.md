@@ -1,4 +1,4 @@
-# OpenWatch
+# OpenWatch - Release & Security Watcher
 
 **Release & security watcher for open-source GitHub projects.**
 
