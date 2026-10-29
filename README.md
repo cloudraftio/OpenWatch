@@ -286,3 +286,6 @@ The watcher is designed to be idempotent, so running it repeatedly won't create 
 - Client notifications are tracked using the client and CVE combination.
 
 If a run doesn't find anything new, it simply doesn't write any new rows. An unchanged database usually means the watcher is already up to date—not that something went wrong.
+## License
+
+OpenWatch is released under the [MIT License](LICENSE).
