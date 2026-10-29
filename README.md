@@ -1,20 +1,102 @@
-# Release & Security Watcher
+# OpenWatch
 
-POC. This proof of concept keeps an eye on an open-source GitHub project for new releases, security advisories, CVEs, and LTS (Long-Term Support) updates. Instead of sending every client the same generic update, it checks which version each client is running and only reports the changes that are actually relevant to them.
+**Release & security watcher for open-source GitHub projects.**
+
+OpenWatch keeps an eye on an open-source GitHub project for new releases,
+security advisories, CVEs, and LTS (Long-Term Support) lifecycle changes.
+Instead of sending every client the same generic update, it checks which
+version each client is running and reports only the changes that actually
+affect them, ranked by how urgently they need acting on.
 
 Any public GitHub repository works — Prometheus is just the default.
 
-## How to run
+## Features
+
+- **Release tracking.** Reads GitHub Releases, or falls back to git tags for
+  projects that don't publish Releases. "Latest" means highest SemVer, not the
+  most recent publish date.
+- **CVE collection.** Collects CVEs from three places: `[SECURITY]` changelog
+  bullets, any `CVE-…` ID mentioned in release notes, and the project's GitHub
+  Security Advisories. A CVE reported by more than one source becomes a single
+  finding.
+- **Exploitation signals.** Each CVE is checked against the CISA Known
+  Exploited Vulnerabilities (KEV) catalog and given its FIRST EPSS score.
+- **Per-client exposure.** Each client's recorded version is compared with the
+  releases that fixed each CVE (LTS backports included), and the report names
+  the upgrade that clears it.
+- **LTS lifecycle.** Tracks the latest patch on the active LTS branch and sends
+  reminders before a branch reaches end of life, for projects that publish an
+  LTS table.
+- **Reports and delivery.** Produces a markdown or self-contained HTML report,
+  and can post a summary to Slack.
+- **Pluggable storage.** DuckDB (the default), MotherDuck, Google Sheets, or a
+  local JSON file.
+- **Safe to re-run and schedule.** A run reports only what is new since the
+  last one, and a cron script watches several repos in turn.
+
+## Quickstart
+
+You need Python 3.10 or newer.
 
 ```bash
+git clone https://github.com/cloudraftio/OpenWatch.git
+cd OpenWatch
 python -m venv .venv && source .venv/bin/activate
-
 pip install -e .
 
-openwatch run
+# Optional: raises the GitHub API limit from 60 to 5,000 requests/hour
+export GITHUB_TOKEN=<token>
 ```
 
-An interactive run starts by asking which repo to watch:
+Record a client and the version it runs, then watch the repo and build a report:
+
+```bash
+# 1. Record who runs what (use a full MAJOR.MINOR.PATCH version)
+openwatch --repo prometheus/prometheus add-client --name "Acme Corp" --version 2.53.0 --contact ops@acme.example
+
+# 2. Fetch releases, CVEs and LTS data, store state, and print the digest
+openwatch --repo prometheus/prometheus run
+
+# 3. See where every client stands, as a printable HTML page
+openwatch --repo prometheus/prometheus report -o report.html
+```
+
+State is kept in `openwatch.duckdb` in the working directory. The first run
+treats every existing release and CVE as new; later runs report only what
+changed since then.
+
+Next steps:
+
+- Watch several projects, or run on a cron schedule — see
+  [Running it on a schedule](#running-it-on-a-schedule).
+- Post reports to Slack by setting `SLACK_WEBHOOK_URL` — see [Reports](#reports).
+- Share the data with non-engineers through Google Sheets — see
+  [Storing data in Google Sheets](#storing-data-in-google-sheets).
+
+## Architecture
+
+![OpenWatch architecture](utils/architecture.png)
+
+**One analysis, two outputs.** Both commands go through the same `analyse()`
+step, which only reads from upstream sources and never writes to storage, so
+`run` and `report` always agree on which CVEs exist and which releases fixed
+them. They differ in what they do with the result:
+
+- `run` answers *what changed since last time*. It records new releases and
+  CVEs as seen, maps the new advisories onto each client, and writes state to
+  storage **before** notifying, so a storage failure can't leave a notification
+  sent without a record of it.
+- `report` answers *what is true right now*. It ignores notification history,
+  so it is complete every time, and ranks every client's exposure by priority.
+
+**Pluggable at the edges.** Storage backends, CVE sources, changelog parsers
+and notifiers each implement a small base class, so adding one doesn't touch the
+pipeline. govulncheck and Trivy CVE sources, an email notifier, and an
+Exa/Parallel changelog parser exist as stubs.
+
+## Choosing a repo
+
+A bare `openwatch run` (no `--repo`) starts by asking which repo to watch:
 
 ```text
 Which open-source repo do you want to watch?
@@ -42,7 +124,7 @@ WATCH_REPO=hashicorp/vault openwatch run   # same thing, via the environment
 | CVEs | Any `CVE-…` mentioned anywhere in a release body is collected, for every project. |
 | LTS lifecycle | Only for projects known to publish a "List of LTS releases" markdown table. Prometheus ships with one out of the box; see [profiles.py](src/openwatch/profiles.py) to add another, or set `LTS_DOCS_REPO` / `LTS_DOC_PATH`. Other repos simply run without that section. |
 
-### Reports
+## Reports
 
 `openwatch report` shows where every client stands right now — unlike the digest, it
 ignores what has already been notified, so it is complete every time.
@@ -76,7 +158,7 @@ its most urgent CVEs, the upgrade that clears them, and the CVEs by blast radius
 can't carry files, so the full HTML/markdown report stays wherever `-o` wrote it. A failed
 post makes the command exit non-zero, so a broken webhook doesn't go unnoticed.
 
-### Clients
+## Clients
 
 The first interactive run asks for client names and the version each one
 runs, so advisories can be mapped per client. Press Enter at the name prompt
@@ -286,6 +368,7 @@ The watcher is designed to be idempotent, so running it repeatedly won't create 
 - Client notifications are tracked using the client and CVE combination.
 
 If a run doesn't find anything new, it simply doesn't write any new rows. An unchanged database usually means the watcher is already up to date—not that something went wrong.
+
 ## License
 
 OpenWatch is released under the [MIT License](LICENSE).
