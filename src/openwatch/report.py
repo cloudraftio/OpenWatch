@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from . import risk, scoring, semver
 from .clients import Client
-from .cve.base import CVEFinding
+from .cve.base import CVEFinding, advisory_url
 from .risk import ClientRisk, Exposure
 from .scoring import Assessment, Priority
 from .semver import Version
@@ -38,6 +38,10 @@ class ScoredRisk:
     @property
     def recommended_version(self):
         return self.risk.recommended_version
+
+    @property
+    def url(self) -> str | None:
+        return self.finding.link
 
     @property
     def priority(self) -> Priority:
@@ -104,6 +108,14 @@ class FleetReport:
         rows = [(cve, names, fixes) for cve, (names, fixes) in index.items()]
         rows.sort(key=lambda row: (-len(row[1]), row[0]))
         return rows
+
+    def cve_url(self, cve_id: str) -> str | None:
+        """The advisory link for a CVE in this report, for views keyed on the bare ID."""
+        for report in self.clients:
+            for item in report.affected + report.unknown:
+                if item.cve_id == cve_id:
+                    return item.url
+        return advisory_url(cve_id)
 
     @property
     def clients_needing_action(self) -> int:
@@ -218,13 +230,13 @@ def render_markdown(report: FleetReport) -> str:
             for item in entry.affected:
                 fix = f" -> upgrade to {item.recommended_version}" if item.recommended_version else ""
                 out.append(
-                    f"- [{item.priority.label.upper()}] **{item.cve_id}**{fix}  \n"
+                    f"- [{item.priority.label.upper()}] **{_md_link(item.cve_id, item.url)}**{fix}  \n"
                     f"  {item.assessment.summary}  \n  {item.reason}"
                 )
         if entry.unknown:
             out += ["", f"### Needs review ({len(entry.unknown)})", ""]
             for item in entry.unknown:
-                out.append(f"- **{item.cve_id}** - {item.assessment.summary}  \n  {item.reason}")
+                out.append(f"- **{_md_link(item.cve_id, item.url)}** - {item.assessment.summary}  \n  {item.reason}")
         if not entry.affected and not entry.unknown:
             out += ["", "No known exposure."]
 
@@ -232,14 +244,25 @@ def render_markdown(report: FleetReport) -> str:
     if index:
         out += ["", "## CVEs by blast radius", "", "| CVE | Clients affected | Who | Fixed in |", "|---|---|---|---|"]
         for cve_id, names, fixes in index:
-            out.append(f"| {cve_id} | {len(names)} | {', '.join(names)} | {', '.join(fixes) or '-'} |")
+            out.append(f"| {_md_link(cve_id, report.cve_url(cve_id))} | {len(names)} | {', '.join(names)} | {', '.join(fixes) or '-'} |")
 
     out += ["", "---", "", SEVERITY_CAVEAT]
     return "\n".join(out) + "\n"
 
 
+def _md_link(text: str, url: str | None) -> str:
+    return f"[{text}]({url})" if url else text
+
+
 def _esc(value) -> str:
     return html.escape(str(value), quote=True)
+
+
+def _html_link(text: str, url: str | None) -> str:
+    """Escaped link text, wrapped in an anchor when there is somewhere to send the reader."""
+    if not url:
+        return _esc(text)
+    return f'<a href="{_esc(url)}" target="_blank" rel="noopener noreferrer">{_esc(text)}</a>'
 
 
 REPORT_CSS = """
@@ -286,6 +309,8 @@ h2 { margin: 0; font-family: ui-serif, "Iowan Old Style", Georgia, serif;
 h3 { margin: 0; font-size: .78rem; letter-spacing: .1em; text-transform: uppercase;
   color: var(--muted); font-weight: 700; }
 .meta { margin: 0; color: var(--muted); font-size: .92rem; }
+.report a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.report a:hover { text-decoration-thickness: 2px; }
 .meta code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
   color: var(--ink); font-size: .88em; }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 1px;
@@ -363,7 +388,7 @@ def _risk_items(items: list[ScoredRisk]) -> str:
         )
         signals = f'<span class="signals">{_esc(item.assessment.summary)}</span>'
         rows.append(
-            f'<li class="risk"><span class="id">{badge} {_esc(item.cve_id)}</span>{fix}'
+            f'<li class="risk"><span class="id">{badge} {_html_link(item.cve_id, item.url)}</span>{fix}'
             f'{signals}<span class="why">{_esc(item.reason)}</span></li>'
         )
     return f'<ul class="risks">{"".join(rows)}</ul>'
@@ -438,7 +463,7 @@ def render_html(report: FleetReport, standalone: bool = True) -> str:
     index = report.cve_index
     if index:
         rows = "".join(
-            f'<tr><td class="mono">{_esc(cve_id)}</td><td class="num">{len(names)}</td>'
+            f'<tr><td class="mono">{_html_link(cve_id, report.cve_url(cve_id))}</td><td class="num">{len(names)}</td>'
             f'<td>{_esc(", ".join(names))}</td><td class="mono">{_esc(", ".join(fixes)) or "&mdash;"}</td></tr>'
             for cve_id, names, fixes in index
         )

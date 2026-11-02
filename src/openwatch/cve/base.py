@@ -5,6 +5,24 @@ import abc
 from dataclasses import dataclass
 
 
+def advisory_url(cve_id: str, url: str | None = None) -> str | None:
+    """Where a reader should go to read about this CVE.
+
+    Prefers the URL a source supplied (usually the project's own advisory); otherwise
+    falls back to the canonical public record for the ID, so every finding gets a link
+    even when it was only spotted in release notes.
+    """
+    if url and url.startswith(("https://", "http://")):
+        return url
+    if cve_id.startswith("CVE-"):
+        return f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+    if cve_id.startswith("GHSA-"):
+        return f"https://github.com/advisories/{cve_id}"
+    if cve_id.startswith("GO-"):
+        return f"https://pkg.go.dev/vuln/{cve_id}"
+    return None
+
+
 @dataclass(frozen=True)
 class CVEFinding:
     """A single CVE affecting the watched project, normalised across all sources."""
@@ -20,6 +38,11 @@ class CVEFinding:
     cvss_vector: str | None = None  # e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H
     kev: bool = False  # Listed in CISA's Known Exploited Vulnerabilities catalogue.
     epss: float | None = None  # Probability of exploitation in the next 30 days (0-1).
+
+    @property
+    def link(self) -> str | None:
+        """The advisory or public CVE record to point readers at."""
+        return advisory_url(self.cve_id, self.url)
 
     def merge(self, other: "CVEFinding") -> "CVEFinding":
         """Combine two sources' views of the same CVE, preferring whichever knows more."""

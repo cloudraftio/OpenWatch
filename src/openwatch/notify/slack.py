@@ -35,6 +35,15 @@ def _esc(value) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _link(text: str, url: str | None) -> str:
+    """Bold CVE ID, made clickable when there is an advisory to point at."""
+    if not url:
+        return f"*{_esc(text)}*"
+    # Slack link syntax is <url|text>; a raw "|" or ">" in the URL would end it early.
+    safe_url = _esc(url).replace("|", "%7C")
+    return f"<{safe_url}|*{_esc(text)}*>"
+
+
 def _section(text: str) -> dict:
     return {"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}}
 
@@ -72,11 +81,11 @@ def render_report_blocks(report: FleetReport) -> list[dict]:
         lines.append(verdict + ".")
         for item in entry.affected[:MAX_RISKS_PER_CLIENT]:
             fix = f" -> {_esc(item.recommended_version)}" if item.recommended_version else ""
-            lines.append(f"• `{item.priority.label.upper()}` *{_esc(item.cve_id)}*{fix} - {_esc(item.assessment.summary)}")
+            lines.append(f"• `{item.priority.label.upper()}` {_link(item.cve_id, item.url)}{fix} - {_esc(item.assessment.summary)}")
         if len(entry.affected) > MAX_RISKS_PER_CLIENT:
             lines.append(f"• +{len(entry.affected) - MAX_RISKS_PER_CLIENT} more affected")
         for item in entry.unknown[:MAX_RISKS_PER_CLIENT]:
-            lines.append(f"• `REVIEW` *{_esc(item.cve_id)}* - {_esc(item.assessment.summary)}")
+            lines.append(f"• `REVIEW` {_link(item.cve_id, item.url)} - {_esc(item.assessment.summary)}")
         if len(entry.unknown) > MAX_RISKS_PER_CLIENT:
             lines.append(f"• +{len(entry.unknown) - MAX_RISKS_PER_CLIENT} more to review")
         blocks.append(_section("\n".join(lines)))
@@ -86,7 +95,7 @@ def render_report_blocks(report: FleetReport) -> list[dict]:
     index = report.cve_index
     if index:
         rows = [
-            f"• *{_esc(cve)}* - {len(names)} client(s), fixed in {_esc(', '.join(fixes) or '-')}"
+            f"• {_link(cve, report.cve_url(cve))} - {len(names)} client(s), fixed in {_esc(', '.join(fixes) or '-')}"
             for cve, names, fixes in index[:MAX_INDEX_ROWS]
         ]
         if len(index) > MAX_INDEX_ROWS:
